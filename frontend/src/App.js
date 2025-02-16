@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Container, Box, Typography, Paper, Button, TextField, Grid, LinearProgress, Alert } from '@mui/material';
+import { Container, Box, Typography, Paper, Button, TextField, Grid, LinearProgress, Alert, Switch, FormControlLabel } from '@mui/material';
 import { ThemeProvider, createTheme } from '@mui/material/styles';
 import { io } from 'socket.io-client';
 
@@ -18,6 +18,7 @@ function App() {
     batch_size: 32,
     epochs: 100,
     image_size: 256,
+    use_ada: true,
   });
   const [isTraining, setIsTraining] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -217,6 +218,19 @@ function App() {
                   onChange={handleParamChange('image_size')}
                   sx={{ mb: 2 }}
                 />
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={trainingParams.use_ada}
+                      onChange={(e) => setTrainingParams(prev => ({
+                        ...prev,
+                        use_ada: e.target.checked
+                      }))}
+                    />
+                  }
+                  label="Enable Adaptive Discriminator Augmentation (ADA)"
+                  sx={{ mb: 2 }}
+                />
                 <Button
                   variant="contained"
                   onClick={startTraining}
@@ -249,6 +263,16 @@ function App() {
                     <Typography>
                       Discriminator Loss: {currentMetrics.d_loss.toFixed(4)}
                     </Typography>
+                    {currentMetrics.ada_p !== undefined && (
+                      <>
+                        <Typography>
+                          ADA Probability: {(currentMetrics.ada_p * 100).toFixed(1)}%
+                        </Typography>
+                        <Typography>
+                          Real-time Sign: {currentMetrics.ada_rt.toFixed(3)}
+                        </Typography>
+                      </>
+                    )}
                   </>
                 )}
               </Paper>
