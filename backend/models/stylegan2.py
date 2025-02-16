@@ -96,14 +96,38 @@ class ImageDataset(Dataset):
 
 class StyleGAN2Trainer:
     def __init__(self, image_dir, image_size=256, batch_size=32, lr=0.002, use_ada=True):
-        # Check if CUDA is available and properly configured
+        # Check CUDA availability and configure for GTX 1080
         cuda_available = torch.cuda.is_available()
         if cuda_available:
             try:
                 # Try to create a tensor on GPU to verify CUDA works
                 test_tensor = torch.zeros(1).cuda()
                 self.device = torch.device('cuda')
-                print("Using GPU for training")
+                
+                # Get GPU info
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**2  # Convert to MB
+                print(f"Using GPU: {gpu_name} ({gpu_memory:.0f}MB)")
+                
+                # Optimize batch size for GTX 1080 (8GB VRAM)
+                # Adjust based on image size to prevent OOM
+                if image_size >= 512:
+                    optimal_batch = 8
+                elif image_size >= 256:
+                    optimal_batch = 16
+                else:
+                    optimal_batch = 32
+                    
+                if batch_size > optimal_batch:
+                    print(f"Reducing batch size to {optimal_batch} for optimal GPU performance")
+                    batch_size = optimal_batch
+                
+                # Enable cudnn benchmarking for better performance
+                torch.backends.cudnn.benchmark = True
+                
+                # Set default tensor type to cuda
+                torch.set_default_tensor_type('torch.cuda.FloatTensor')
+                
             except RuntimeError as e:
                 print(f"CUDA initialization failed: {e}")
                 print("Falling back to CPU")
@@ -117,6 +141,9 @@ class StyleGAN2Trainer:
             if batch_size > 8:
                 print("Reducing batch size to 8 for CPU training")
                 batch_size = 8
+                
+        # Set memory-efficient gradient accumulation
+        self.gradient_accumulation_steps = max(1, 32 // batch_size)  # Simulate larger batch size
         
         self.image_size = image_size
         self.batch_size = batch_size
@@ -183,77 +210,122 @@ class StyleGAN2Trainer:
         sign = (d_real > 0.5).float().mean().item()
         return sign
         
-    def train_step(self, real_images):
+    def train_step(self, real_images, accumulation_step=0):
         batch_size = real_images.size(0)
         real_images = real_images.to(self.device)
         
+        # Scale losses based on accumulation
+        loss_scale = 1.0 / self.gradient_accumulation_steps
+        
         # Train discriminator
-        self.d_optimizer.zero_grad()
+        if accumulation_step == 0:
+            self.d_optimizer.zero_grad()
         
         label_real = torch.ones(batch_size, 1).to(self.device)
         label_fake = torch.zeros(batch_size, 1).to(self.device)
         
         # Get discriminator predictions for real images
-        d_real = self.discriminator(real_images)
-        d_real_loss = F.binary_cross_entropy(d_real, label_real)
+        with torch.cuda.amp.autocast():  # Mixed precision for better performance
+            d_real = self.discriminator(real_images)
+            d_real_loss = F.binary_cross_entropy(d_real, label_real)
+            
+            # Update ADA probability based on discriminator's performance on real images
+            if self.use_ada:
+                rt = self.compute_ada_rt(d_real)
+                ada_p = self.augment_pipe.update(rt - self.augment_pipe.target_p)
+                self.ada_stats['p'].append(ada_p)
+                self.ada_stats['rt'].append(rt)
+            
+            # Generate and classify fake images
+            z = torch.randn(batch_size, 512).to(self.device)
+            fake_images = self.generator(z)
+            d_fake = self.discriminator(fake_images.detach())
+            d_fake_loss = F.binary_cross_entropy(d_fake, label_fake)
+            
+            d_loss = (d_real_loss + d_fake_loss) * loss_scale
         
-        # Update ADA probability based on discriminator's performance on real images
-        if self.use_ada:
-            rt = self.compute_ada_rt(d_real)
-            ada_p = self.augment_pipe.update(rt - self.augment_pipe.target_p)
-            self.ada_stats['p'].append(ada_p)
-            self.ada_stats['rt'].append(rt)
-        
-        # Generate and classify fake images
-        z = torch.randn(batch_size, 512).to(self.device)
-        fake_images = self.generator(z)
-        d_fake = self.discriminator(fake_images.detach())
-        d_fake_loss = F.binary_cross_entropy(d_fake, label_fake)
-        
-        d_loss = d_real_loss + d_fake_loss
         d_loss.backward()
-        self.d_optimizer.step()
+        
+        if (accumulation_step + 1) % self.gradient_accumulation_steps == 0:
+            # Clip gradients for stability
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+            self.d_optimizer.step()
         
         # Train generator
-        self.g_optimizer.zero_grad()
+        if accumulation_step == 0:
+            self.g_optimizer.zero_grad()
         
-        d_fake = self.discriminator(fake_images)
-        g_loss = F.binary_cross_entropy(d_fake, label_real)
+        with torch.cuda.amp.autocast():
+            d_fake = self.discriminator(fake_images)
+            g_loss = F.binary_cross_entropy(d_fake, label_real) * loss_scale
         
         g_loss.backward()
-        self.g_optimizer.step()
+        
+        if (accumulation_step + 1) % self.gradient_accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+            self.g_optimizer.step()
+        
+        # Free up memory
+        torch.cuda.empty_cache()
         
         return g_loss.item(), d_loss.item()
     
     def train(self, num_epochs, callback=None):
-        for epoch in range(num_epochs):
-            g_losses = []
-            d_losses = []
+        try:
+            # Enable cuDNN autotuner
+            torch.backends.cudnn.benchmark = True
             
-            for i, real_images in enumerate(self.dataloader):
-                g_loss, d_loss = self.train_step(real_images)
-                g_losses.append(g_loss)
-                d_losses.append(d_loss)
+            for epoch in range(num_epochs):
+                g_losses = []
+                d_losses = []
                 
-                if callback:
-                    metrics = {
-                        'epoch': epoch + 1,
-                        'batch': i + 1,
-                        'g_loss': g_loss,
-                        'd_loss': d_loss,
-                        'progress': (epoch * len(self.dataloader) + i + 1) / (num_epochs * len(self.dataloader))
-                    }
+                for i, real_images in enumerate(self.dataloader):
+                    # Calculate accumulation step
+                    accumulation_step = i % self.gradient_accumulation_steps
                     
-                    if self.use_ada:
-                        metrics.update({
-                            'ada_p': self.augment_pipe.p,
-                            'ada_rt': self.ada_stats['rt'][-1] if self.ada_stats['rt'] else 0
-                        })
+                    # Train with gradient accumulation
+                    g_loss, d_loss = self.train_step(real_images, accumulation_step)
+                    
+                    # Only record losses for the last accumulation step
+                    if accumulation_step == self.gradient_accumulation_steps - 1:
+                        g_losses.append(g_loss * self.gradient_accumulation_steps)
+                        d_losses.append(d_loss * self.gradient_accumulation_steps)
+                    
+                    if callback and accumulation_step == self.gradient_accumulation_steps - 1:
+                        # Calculate GPU memory usage
+                        gpu_memory_used = torch.cuda.memory_allocated() / 1024**2  # MB
+                        gpu_memory_cached = torch.cuda.memory_reserved() / 1024**2  # MB
                         
-                    callback(metrics)
-            
-            self.g_losses.append(np.mean(g_losses))
-            self.d_losses.append(np.mean(d_losses))
+                        metrics = {
+                            'epoch': epoch + 1,
+                            'batch': i + 1,
+                            'g_loss': g_loss * self.gradient_accumulation_steps,
+                            'd_loss': d_loss * self.gradient_accumulation_steps,
+                            'progress': (epoch * len(self.dataloader) + i + 1) / (num_epochs * len(self.dataloader)),
+                            'gpu_memory_used': f"{gpu_memory_used:.0f}MB",
+                            'gpu_memory_cached': f"{gpu_memory_cached:.0f}MB"
+                        }
+                        
+                        if self.use_ada:
+                            metrics.update({
+                                'ada_p': self.augment_pipe.p,
+                                'ada_rt': self.ada_stats['rt'][-1] if self.ada_stats['rt'] else 0
+                            })
+                            
+                        callback(metrics)
+                
+                self.g_losses.append(np.mean(g_losses))
+                self.d_losses.append(np.mean(d_losses))
+                
+                # Clear GPU cache at the end of each epoch
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            print(f"Training error: {str(e)}")
+            raise e
+        finally:
+            # Clean up GPU memory
+            torch.cuda.empty_cache()
     
     def generate_samples(self, num_samples=1):
         self.generator.eval()
