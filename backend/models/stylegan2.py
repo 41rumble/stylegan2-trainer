@@ -96,7 +96,28 @@ class ImageDataset(Dataset):
 
 class StyleGAN2Trainer:
     def __init__(self, image_dir, image_size=256, batch_size=32, lr=0.002, use_ada=True):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Check if CUDA is available and properly configured
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            try:
+                # Try to create a tensor on GPU to verify CUDA works
+                test_tensor = torch.zeros(1).cuda()
+                self.device = torch.device('cuda')
+                print("Using GPU for training")
+            except RuntimeError as e:
+                print(f"CUDA initialization failed: {e}")
+                print("Falling back to CPU")
+                self.device = torch.device('cpu')
+                if batch_size > 8:
+                    print("Reducing batch size to 8 for CPU training")
+                    batch_size = 8
+        else:
+            print("No GPU detected, using CPU")
+            self.device = torch.device('cpu')
+            if batch_size > 8:
+                print("Reducing batch size to 8 for CPU training")
+                batch_size = 8
+        
         self.image_size = image_size
         self.batch_size = batch_size
         self.lr = lr
